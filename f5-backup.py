@@ -8,30 +8,10 @@ import sys
 import hashlib
 from urllib3.exceptions import InsecureRequestWarning
 
-# Define a new argument parser
-parser=optparse.OptionParser()
-
-# import options
-parser.add_option('--hostname', help='Pass the F5 Big-ip hostname')
-
-# Parse arguments
-(opts,args) = parser.parse_args()
-
-# Check if --hostname argument populated or not
-if not opts.hostname:
-    print('--hostname argument is required.')
-    exit(1)
-
 # Root CA for SSL verification
 ROOTCA = ''
-# List of URL for F5 queries
-URL_BASE = 'https://%s/mgmt' % opts.hostname
-URL_AUTH = '%s/shared/authn/login' % URL_BASE
-URL_UCS = '%s/tm/sys/ucs' % URL_BASE
-URL_DOWNLOAD = '%s/shared/file-transfer/ucs-downloads/' % URL_BASE
-URL_BASH = '%s/tm/util/bash' % URL_BASE
-
 CHECKSUM = ''
+HOSTNAME = ''
 STATUS = False
 
 # credential Ask for user Active Directory authentication information
@@ -52,6 +32,10 @@ def credential():
 # get_token() will call F5 Big-ip API with username and password to obtain an authentication
 # security token
 def get_token(session):
+    # Build URL
+    URL_AUTH = 'https://%s/mgmt/shared/authn/login' % HOSTNAME
+    
+    # Request user credential
     username, password = credential()
 
     # prepare payload for request
@@ -83,8 +67,10 @@ def get_token(session):
 # create_ucs will call F5 Big-ip API with security token authentication to create a timestamps ucs backup
 # file of the F5 Big-ip device configuration
 def create_ucs(session):
+    URL_UCS = 'https://%s/mgmt/tm/sys/ucs' % HOSTNAME
+
     # generate a timestamp file name
-    ucs_filename = opts.hostname + '_' + datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S') + '.ucs'
+    ucs_filename = HOSTNAME + '_' + datetime.datetime.now().strftime('%Y-%m-%d-%H%M%S') + '.ucs'
 
     # prepare the http request payload
     payload = {}
@@ -105,11 +91,13 @@ def create_ucs(session):
             exit(1)
 
     # Print a successful message log
-    print("UCS backup of file %s on host %s successfully completed" % (resp['name'], opts.hostname))
+    print("UCS backup of file %s on host %s successfully completed" % (resp['name'], HOSTNAME))
 
     return ucs_filename, checksum(session, ucs_filename)
 
 def checksum(session, filename):
+    URL_BASH = 'https://%s/mgmt/tm/util/bash' % HOSTNAME
+
     # prepare the http request payload
     payload = {}
     payload['command'] = 'run'
@@ -128,6 +116,7 @@ def checksum(session, filename):
 # delete_ucs will call F5 Big-ip API with security token authentication to delete the ucs backup
 # file after local download
 def delete_ucs(session, ucs_filename):
+    URL_BASH = 'https://%s/mgmt/tm/util/bash' % HOSTNAME
     # prepare the http request payload
     payload = {}
     payload['command'] = 'run'
@@ -142,13 +131,19 @@ def delete_ucs(session, ucs_filename):
 def ucsDownload(ucs_filename, token):
     global STATUS
 
+    # Build request URL
+    URL_DOWNLOAD = 'https://%s/mgmt/shared/file-transfer/ucs-downloads/' % HOSTNAME
+
+    # Define chunck size for UCS backup file
     chunk_size = 512 * 1024
 
+    # Define specific request headers
     headers = {
         'Content-Type': 'application/octet-stream',
         'X-F5-Auth-Token': token
     }
     
+    # set filename and uri for request
     filename = os.path.basename(ucs_filename)
     uri = '%s%s' % (URL_DOWNLOAD, filename)
     
@@ -215,10 +210,15 @@ def sha256_checksum(filename, block_size=65536):
             sha256.update(block)
     return sha256.hexdigest()
 
-def main():
-    global STATUS, CHECKSUM
+def f5Backup(hostname):
+    global STATUS, CHECKSUM,HOSTNAME
     counter = 0
+    
+    HOSTNAME = hostname
+
+    # Disable SSL warning for Insecure request
     requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
+    
     # create a new https session
     session = requests.Session()
 
@@ -235,9 +235,8 @@ def main():
     session.timeout = '30'
 
     # get a new authentication security token from F5
-    print('Start remote backup F5 big-Ip device %s ' % opts.hostname)
+    print('Start remote backup F5 big-Ip device %s ' % HOSTNAME)
     token = get_token(session)
-    print(token)
     
     # disable username, password authentication and replace by security token 
     # authentication in the session header
@@ -245,7 +244,7 @@ def main():
     session.headers.update({'X-F5-Auth-Token': token})
     
     # create a new F5 big-ip backup file on the F5 device
-    print('Creation UCS backup file on F5 device %s' % opts.hostname)
+    print('Creation UCS backup file on F5 device %s' % HOSTNAME)
     ucs_filename, CHECKSUM = create_ucs(session)
     
     # locally download the created ucs backup file
@@ -255,7 +254,8 @@ def main():
         ucsDownload(ucs_filename, token)
         counter+=1
         if counter >2:
-            print('UCS backup download failure. inconscistent checksum between origin and destination')
+            print('UCS backup download failure. inconscistent' \
+            'checksum between origin and destination')
             print('program will exit and ucs file will not be deleted from F5 device')
             exit(1)
     
@@ -266,4 +266,18 @@ def main():
     delete_ucs(session, ucs_filename)
 
 if __name__ == "__main__":
-    main()
+    # Define a new argument parser
+    parser=optparse.OptionParser()
+
+    # import options
+    parser.add_option('--hostname', help='Pass the F5 Big-ip hostname')
+
+    # Parse arguments
+    (opts,args) = parser.parse_args()
+
+    # Check if --hostname argument populated or not
+    if not opts.hostname:
+        print('--hostname argument is required.')
+        exit(1)
+
+    f5Backup(opts.hostname)
