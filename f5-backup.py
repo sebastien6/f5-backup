@@ -1,10 +1,12 @@
 import os
 import json
 import datetime
-from requests import Request, Session
+import requests
 import getpass
 import optparse
-
+import sys
+import hashlib
+from urllib3.exceptions import InsecureRequestWarning
 
 # Define a new argument parser
 parser=optparse.OptionParser()
@@ -15,14 +17,22 @@ parser.add_option('--hostname', help='Pass the F5 Big-ip hostname')
 # Parse arguments
 (opts,args) = parser.parse_args()
 
+# Check if --hostname argument populated or not
 if not opts.hostname:
     print('--hostname argument is required.')
     exit(1)
 
+# Root CA for SSL verification
+ROOTCA = ''
+# List of URL for F5 queries
 URL_BASE = 'https://%s/mgmt' % opts.hostname
 URL_AUTH = '%s/shared/authn/login' % URL_BASE
 URL_UCS = '%s/tm/sys/ucs' % URL_BASE
 URL_DOWNLOAD = '%s/shared/file-transfer/ucs-downloads/' % URL_BASE
+URL_BASH = '%s/tm/util/bash' % URL_BASE
+
+CHECKSUM = ''
+STATUS = False
 
 # credential Ask for user Active Directory authentication information
 # with a verification of entered password
@@ -32,8 +42,8 @@ def credential():
     # start infinite loop
     while True:
         # Capture password without echoing 
-        pwd1 = getpass.getpass('Enter Password for AD account: ')
-        pwd2 = getpass.getpass('Re-Enter Password for AD account: ')
+        pwd1 = getpass.getpass('%s, enter your password: ' % user)
+        pwd2 = getpass.getpass('%s, re-Enter Password: ' % user)
         # Compare the two entered password to avoid typo error
         if pwd1 == pwd2:
             # break infinite loop by returning value
@@ -96,69 +106,160 @@ def create_ucs(session):
 
     # Print a successful message log
     print("UCS backup of file %s on host %s successfully completed" % (resp['name'], opts.hostname))
-    return ucs_filename
+
+    return ucs_filename, checksum(session, ucs_filename)
+
+def checksum(session, filename):
+    # prepare the http request payload
+    payload = {}
+    payload['command'] = 'run'
+    payload['utilCmdArgs'] = '''-c "sha256sum /var/local/ucs/%s"''' % filename
+    # send request and handle connectivity error with try/except
+    try:
+        resp = session.post(URL_BASH, json.dumps(payload)).json()['commandResult']
+    except:
+        print("Error sending request to F5 big-ip. Check your hostname or network connection")
+        exit(1)
+
+    checksum = resp.split()
+    
+    return checksum[0]
 
 # delete_ucs will call F5 Big-ip API with security token authentication to delete the ucs backup
 # file after local download
 def delete_ucs(session, ucs_filename):
-    # variable hosting the complete download path
-    url = '%s/%s' % (URL_UCS, ucs_filename)
-
+    # prepare the http request payload
+    payload = {}
+    payload['command'] = 'run'
+    payload['utilCmdArgs'] = '''-c "rm -f /var/local/ucs/%s"''' % ucs_filename
     # send request and handle connectivity error with try/except
     try:
-        session.delete(url)
-        print("UCS backup file %s on host %s successfully deleted" % (ucs_filename, opts.hostname))
+        session.post(URL_BASH, json.dumps(payload)).json()
     except:
         print("Error sending request to F5 big-ip. Check your hostname or network connection")
         exit(1)
+
+def ucsDownload(ucs_filename, token):
+    global STATUS
+
+    chunk_size = 512 * 1024
+
+    headers = {
+        'Content-Type': 'application/octet-stream',
+        'X-F5-Auth-Token': token
+    }
     
-# download_ucs will call F5 Big-ip API with security token authentication to download the latest created
-# ucs backup file locally
-def download_ucs(session, ucs_filename):
-    # variable hosting the complete download path
-    url = '%s/%s' % (URL_DOWNLOAD, ucs_filename)
+    filename = os.path.basename(ucs_filename)
+    uri = '%s%s' % (URL_DOWNLOAD, filename)
+    
+    requests.packages
+    with open(ucs_filename, 'wb') as f:
+        start = 0
+        end = chunk_size - 1
+        size = 0
+        current_bytes = 0
 
-    # enable stream option on session to download large file
-    session.stream = True
+        while True:
+            content_range = "%s-%s/%s" % (start, end, size)
+            headers['Content-Range'] = content_range
 
-    # download file from F5 Bip-ip in chuncks to local file to avoid error with
-    # header content-size
-    try: 
-        resp = session.get(url)
-        with open(ucs_filename, 'wb') as f:
-            for chunk in resp.iter_content(chunk_size=1024): 
-                if chunk: # filter out keep-alive new chunks
-                    f.write(chunk)
-        print('File %s was successfully downlaoded locally' % ucs_filename)
-    except:
-        print('Error downloading file %s from F5 bigip %s' % (ucs_filename, opts.hostname))
+            #print headers
+            resp = requests.get(uri,
+                                headers=headers,
+                                verify=False,
+                                stream=True)
+
+            if resp.status_code == 200:
+                # If the size is zero, then this is the first time through the
+                # loop and we don't want to write data because we haven't yet
+                # figured out the total size of the file.
+                if size > 0:
+                    current_bytes += chunk_size
+                    for chunk in resp.iter_content(chunk_size):
+                        f.write(chunk)
+
+                # Once we've downloaded the entire file, we can break out of
+                # the loop
+                if end == size:
+                    break
+
+            crange = resp.headers['Content-Range']
+
+            # Determine the total number of bytes to read
+            if size == 0:
+                size = int(crange.split('/')[-1]) - 1
+
+                # If the file is smaller than the chunk size, BIG-IP will
+                # return an HTTP 400. So adjust the chunk_size down to the
+                # total file size...
+                if chunk_size > size:
+                    end = size
+
+                # ...and pass on the rest of the code
+                continue
+
+            start += chunk_size
+
+            if (current_bytes + chunk_size) > size:
+                end = size
+            else:
+                end = start + chunk_size - 1
+
+    if sha256_checksum(ucs_filename) == CHECKSUM:
+        STATUS = True
+
+def sha256_checksum(filename, block_size=65536):
+    sha256 = hashlib.sha256()
+    with open(filename, 'rb') as f:
+        for block in iter(lambda: f.read(block_size), b''):
+            sha256.update(block)
+    return sha256.hexdigest()
 
 def main():
+    global STATUS, CHECKSUM
+    counter = 0
+    requests.packages.urllib3.disable_warnings(category=InsecureRequestWarning)
     # create a new https session
-    session = Session()
+    session = requests.Session()
 
     # update session header
     session.headers.update({'Content-Type': 'application/json'})
     
     # Disable TLS cert verification
-    session.verify = False
+    if ROOTCA == '':
+        session.verify = False
+    else:
+        session.verify = ROOTCA
 
     # set default request timeout
     session.timeout = '30'
 
     # get a new authentication security token from F5
+    print('Start remote backup F5 big-Ip device %s ' % opts.hostname)
     token = get_token(session)
+    print(token)
     
     # disable username, password authentication and replace by security token 
     # authentication in the session header
     session.auth = None
     session.headers.update({'X-F5-Auth-Token': token})
-
+    
     # create a new F5 big-ip backup file on the F5 device
-    ucs_filename = create_ucs(session)
+    print('Creation UCS backup file on F5 device %s' % opts.hostname)
+    ucs_filename, CHECKSUM = create_ucs(session)
     
     # locally download the created ucs backup file
-    download_ucs(session, ucs_filename)
+    #download_ucs(session, ucs_filename)
+    while not STATUS:
+        print("Download file %s attempt %s" % (ucs_filename, counter+1))
+        ucsDownload(ucs_filename, token)
+        counter+=1
+        if counter >2:
+            print('UCS backup download failure. inconscistent checksum between origin and destination')
+            print('program will exit and ucs file will not be deleted from F5 device')
+            exit(1)
+    
+    print('UCS backup checksum verification successful')
 
     # delete the ucs file from f5 after local download
     # to keep f5 disk space clean
